@@ -230,14 +230,18 @@ function loadTabContent(tab) {
     // 处理新窗口打开请求
     tab.view.webContents.setWindowOpenHandler(({ url, disposition }) => {
       // 如果是用户明确要求在新标签页中打开（如右键菜单）
+      const safeUrl = normalizeNavigationUrl(url);
+      if (!safeUrl) {
+        return { action: 'deny' };
+      }
       if (disposition === 'new-window' || disposition === 'foreground-tab') {
         // 创建新标签页并加载URL
-        const newTab = createNewTab(url);
+        const newTab = createNewTab(safeUrl);
         switchToTab(tabs.indexOf(newTab));
       } else {
         // 其他情况在当前标签页中加载URL
-        tab.url = url;
-        tab.view.webContents.loadURL(url);
+        tab.url = safeUrl;
+        tab.view.webContents.loadURL(safeUrl);
       }
       // 阻止默认的新窗口行为
       return { action: 'deny' };
@@ -245,6 +249,10 @@ function loadTabContent(tab) {
 
     // 处理导航事件，确保链接在当前标签页中打开
     tab.view.webContents.on('will-navigate', (event, navigationUrl) => {
+      if (!normalizeNavigationUrl(navigationUrl)) {
+        event.preventDefault();
+        return;
+      }
       // 允许导航在当前标签页中进行
       tab.url = navigationUrl;
       mainWindow.webContents.send('tab-updated', {
@@ -979,16 +987,49 @@ ipcMain.on('toggle-tabbar-collapse', (event, collapsed) => {
   updateBrowserViewBounds();
 });
 
+const SAFE_NAV_SCHEMES = new Set(['http:', 'https:', 'about:', 'file:']);
+const APP_INTERNAL_ROOT = path.resolve(__dirname, 'src');
+
+function normalizeNavigationUrl(value) {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  if (!raw || raw.length > 8192) return null;
+  let parsed = null;
+  try {
+    parsed = new URL(raw);
+  } catch (parseError) {
+    return null;
+  }
+  if (!parsed || !SAFE_NAV_SCHEMES.has(parsed.protocol)) return null;
+  if (parsed.protocol === 'about:' && parsed.pathname !== 'blank') return null;
+  if (parsed.protocol === 'file:') {
+    let localPath = null;
+    try {
+      localPath = path.resolve(decodeURIComponent(parsed.pathname));
+    } catch (decodeError) {
+      return null;
+    }
+    if (process.platform === 'win32') localPath = localPath.replace(/\\/g, '/');
+    const rootPrefix = APP_INTERNAL_ROOT.replace(/\\/g, '/');
+    if (localPath !== rootPrefix && !localPath.startsWith(rootPrefix + '/')) return null;
+  }
+  return parsed.toString();
+}
+
 ipcMain.handle('navigate-tab', (event, { tabId, url }) => {
   const tab = tabs.find(t => t.id === tabId);
+  const safeUrl = normalizeNavigationUrl(url);
+  if (!safeUrl) {
+    return { success: false, reason: 'unsafe-url' };
+  }
   if (tab) {
-    tab.url = url;
+    tab.url = safeUrl;
     loadTabContent(tab);
     
     // 发送URL更新事件给渲染进程，更新地址栏显示
     mainWindow.webContents.send('tab-updated', {
       id: tab.id,
-      url: url
+      url: safeUrl
     });
     
     return { success: true };
@@ -997,16 +1038,26 @@ ipcMain.handle('navigate-tab', (event, { tabId, url }) => {
 });
 
 ipcMain.handle('create-tab', (event, url) => {
-  const tab = createNewTab(url);
+  const safeUrl = normalizeNavigationUrl(url);
+  if (!safeUrl) {
+    return { success: false, reason: 'unsafe-url' };
+  }
+  const tab = createNewTab(safeUrl);
   return { id: tab.id, index: tabs.length - 1 };
 });
 
 ipcMain.handle('close-tab', (event, tabIndex) => {
+  if (!Number.isInteger(tabIndex) || tabIndex < 0 || tabIndex >= tabs.length) {
+    return { success: false, reason: 'bad-index' };
+  }
   closeTab(tabIndex);
   return { success: true };
 });
 
 ipcMain.handle('switch-tab', (event, tabIndex) => {
+  if (!Number.isInteger(tabIndex) || tabIndex < 0 || tabIndex >= tabs.length) {
+    return { success: false, reason: 'bad-index' };
+  }
   switchToTab(tabIndex);
   return { success: true };
 });
