@@ -230,14 +230,18 @@ function loadTabContent(tab) {
     // 处理新窗口打开请求
     tab.view.webContents.setWindowOpenHandler(({ url, disposition }) => {
       // 如果是用户明确要求在新标签页中打开（如右键菜单）
+      const safeUrl = normalizeNavigationUrl(url);
+      if (!safeUrl) {
+        return { action: 'deny' };
+      }
       if (disposition === 'new-window' || disposition === 'foreground-tab') {
         // 创建新标签页并加载URL
-        const newTab = createNewTab(url);
+        const newTab = createNewTab(safeUrl);
         switchToTab(tabs.indexOf(newTab));
       } else {
         // 其他情况在当前标签页中加载URL
-        tab.url = url;
-        tab.view.webContents.loadURL(url);
+        tab.url = safeUrl;
+        tab.view.webContents.loadURL(safeUrl);
       }
       // 阻止默认的新窗口行为
       return { action: 'deny' };
@@ -245,6 +249,10 @@ function loadTabContent(tab) {
 
     // 处理导航事件，确保链接在当前标签页中打开
     tab.view.webContents.on('will-navigate', (event, navigationUrl) => {
+      if (!normalizeNavigationUrl(navigationUrl)) {
+        event.preventDefault();
+        return;
+      }
       // 允许导航在当前标签页中进行
       tab.url = navigationUrl;
       mainWindow.webContents.send('tab-updated', {
@@ -641,12 +649,146 @@ function closeTab(tabIndex) {
   }
 }
 
+const COSY_TRUSTED_SCHEMES = ['cosy:', 'file:', 'about:'];
+const COSY_ALWAYS_PERMISSIONS = new Set(['fullscreen', 'clipboard-sanitized-write', 'pointerLock']);
+const COSY_PAGE_PERMISSIONS = new Set(['notifications', 'clipboard-read', 'media', 'geolocation', 'midi']);
+
+function cosyNavigationAllowed(targetUrl) {
+  if (typeof targetUrl !== 'string') return false;
+  const lower = targetUrl.toLowerCase();
+  if (lower.startsWith('http://') || lower.startsWith('https://')) return true;
+  return COSY_TRUSTED_SCHEMES.some(prefix => lower.startsWith(prefix));
+}
+
+function cosyTrustedContents(contents) {
+  if (!contents || typeof contents.getURL !== 'function') return false;
+  const current = contents.getURL();
+  if (typeof current !== 'string' || current === '') return false;
+  const lower = current.toLowerCase();
+  return COSY_TRUSTED_SCHEMES.some(prefix => lower.startsWith(prefix));
+}
+
+function cosySanitizeDownloadName(name) {
+  if (typeof name !== 'string' || name === '') return 'download';
+  let out = '';
+  for (const ch of name) {
+    const code = ch.codePointAt(0);
+    if (code < 32 || code === 127) continue;
+    if (ch === '/' || ch === '\\' || ch === ':' || ch === '*' || ch === '?' || ch === '"' || ch === '<' || ch === '>') continue;
+    out += ch;
+  }
+  out = out.trim();
+  if (out === '' || out === '.' || out === '..') return 'download';
+  if (out.length > 180) out = out.slice(0, 180);
+  return out;
+}
+
+function cosyDownloadPathAllowed(target) {
+  if (typeof target !== 'string' || target === '') return true;
+  let resolved;
+  try {
+    resolved = path.resolve(target);
+  } catch (err) {
+    return false;
+  }
+  const roots = [];
+  try { roots.push(path.resolve(app.getPath('downloads'))); } catch (err) {}
+  try { roots.push(path.resolve(app.getPath('documents'))); } catch (err) {}
+  try { roots.push(path.resolve(app.getPath('desktop'))); } catch (err) {}
+  return roots.some(root => resolved === root || resolved.startsWith(root + path.sep));
+}
+
+function setupSessionHardening() {
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+    if (COSY_ALWAYS_PERMISSIONS.has(permission)) {
+      callback(true);
+      return;
+    }
+    if (!COSY_PAGE_PERMISSIONS.has(permission)) {
+      callback(false);
+      return;
+    }
+    if (!cosyTrustedContents(contents)) {
+      callback(false);
+      return;
+    }
+    const requesting = details && typeof details.requestingUrl === 'string' ? details.requestingUrl : '';
+    if (/^https?:/i.test(requesting)) {
+      callback(false);
+      return;
+    }
+    callback(true);
+  });
+
+  session.defaultSession.setPermissionCheckHandler((contents, permission, requestingOrigin) => {
+    if (COSY_ALWAYS_PERMISSIONS.has(permission)) return true;
+    if (!COSY_PAGE_PERMISSIONS.has(permission)) return false;
+    if (typeof requestingOrigin === 'string' && /^https?:/i.test(requestingOrigin)) return false;
+    return cosyTrustedContents(contents);
+  });
+
+  app.on('web-contents-created', (event, contents) => {
+    contents.on('will-attach-webview', (attachEvent, webPreferences, params) => {
+      const src = params && typeof params.src === 'string' ? params.src : '';
+      const lower = src.toLowerCase();
+      if (!lower.startsWith('cosy://')) {
+        attachEvent.preventDefault();
+        return;
+      }
+      if (!/^cosy:\/\/(setting|newtab|download|history|bookmark)/.test(lower)) {
+        attachEvent.preventDefault();
+        return;
+      }
+      delete webPreferences.preload;
+      webPreferences.nodeIntegration = false;
+      webPreferences.nodeIntegrationInSubFrames = false;
+      webPreferences.contextIsolation = true;
+      webPreferences.sandbox = true;
+      webPreferences.webSecurity = true;
+      webPreferences.allowRunningInsecureContent = false;
+      webPreferences.enableRemoteModule = false;
+    });
+
+    contents.on('will-navigate', (navigateEvent, targetUrl) => {
+      if (!cosyNavigationAllowed(targetUrl)) {
+        navigateEvent.preventDefault();
+      }
+    });
+
+    contents.on('will-redirect', (redirectEvent, targetUrl) => {
+      if (!cosyNavigationAllowed(targetUrl)) {
+        redirectEvent.preventDefault();
+      }
+    });
+
+    contents.setWindowOpenHandler(({ url: openUrl }) => {
+      if (typeof openUrl !== 'string') return { action: 'deny' };
+      const lower = openUrl.toLowerCase();
+      if (lower.startsWith('http://') || lower.startsWith('https://')) {
+        return { action: 'allow', overrideBrowserWindowOptions: { webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true } } };
+      }
+      if (COSY_TRUSTED_SCHEMES.some(prefix => lower.startsWith(prefix))) return { action: 'allow' };
+      return { action: 'deny' };
+    });
+  });
+}
+
 // 下载管理器相关函数
 function setupDownloadManager() {
   session.defaultSession.on('will-download', (event, item, webContents) => {
     const url = item.getURL();
-    const filename = item.getFilename();
+    const filename = cosySanitizeDownloadName(item.getFilename());
     const totalBytes = item.getTotalBytes();
+    const sourceUrl = typeof url === 'string' ? url.toLowerCase() : '';
+    if (!sourceUrl.startsWith('http://') && !sourceUrl.startsWith('https://') && !sourceUrl.startsWith('blob:') && !sourceUrl.startsWith('data:')) {
+      item.cancel();
+      return;
+    }
+    const pendingPath = typeof item.getSavePath === 'function' ? item.getSavePath() : '';
+    if (pendingPath && !cosyDownloadPathAllowed(pendingPath)) {
+      item.cancel();
+      return;
+    }
 
     // 检查是否有预创建的 downloadInfo（来自"另存为"操作）
     let downloadInfo = downloads.find(d => d.url === url && d.item === null && d.isItemValid === false);
@@ -910,6 +1052,7 @@ app.whenReady().then(async () => {
     callback({ path: request.url.substr(7) });
   });
   
+  setupSessionHardening();
   setupDownloadManager();
   
   // 动态生成用户代理
@@ -979,16 +1122,49 @@ ipcMain.on('toggle-tabbar-collapse', (event, collapsed) => {
   updateBrowserViewBounds();
 });
 
+const SAFE_NAV_SCHEMES = new Set(['http:', 'https:', 'about:', 'file:']);
+const APP_INTERNAL_ROOT = path.resolve(__dirname, 'src');
+
+function normalizeNavigationUrl(value) {
+  if (typeof value !== 'string') return null;
+  const raw = value.trim();
+  if (!raw || raw.length > 8192) return null;
+  let parsed = null;
+  try {
+    parsed = new URL(raw);
+  } catch (parseError) {
+    return null;
+  }
+  if (!parsed || !SAFE_NAV_SCHEMES.has(parsed.protocol)) return null;
+  if (parsed.protocol === 'about:' && parsed.pathname !== 'blank') return null;
+  if (parsed.protocol === 'file:') {
+    let localPath = null;
+    try {
+      localPath = path.resolve(decodeURIComponent(parsed.pathname));
+    } catch (decodeError) {
+      return null;
+    }
+    if (process.platform === 'win32') localPath = localPath.replace(/\\/g, '/');
+    const rootPrefix = APP_INTERNAL_ROOT.replace(/\\/g, '/');
+    if (localPath !== rootPrefix && !localPath.startsWith(rootPrefix + '/')) return null;
+  }
+  return parsed.toString();
+}
+
 ipcMain.handle('navigate-tab', (event, { tabId, url }) => {
   const tab = tabs.find(t => t.id === tabId);
+  const safeUrl = normalizeNavigationUrl(url);
+  if (!safeUrl) {
+    return { success: false, reason: 'unsafe-url' };
+  }
   if (tab) {
-    tab.url = url;
+    tab.url = safeUrl;
     loadTabContent(tab);
     
     // 发送URL更新事件给渲染进程，更新地址栏显示
     mainWindow.webContents.send('tab-updated', {
       id: tab.id,
-      url: url
+      url: safeUrl
     });
     
     return { success: true };
@@ -997,16 +1173,26 @@ ipcMain.handle('navigate-tab', (event, { tabId, url }) => {
 });
 
 ipcMain.handle('create-tab', (event, url) => {
-  const tab = createNewTab(url);
+  const safeUrl = normalizeNavigationUrl(url);
+  if (!safeUrl) {
+    return { success: false, reason: 'unsafe-url' };
+  }
+  const tab = createNewTab(safeUrl);
   return { id: tab.id, index: tabs.length - 1 };
 });
 
 ipcMain.handle('close-tab', (event, tabIndex) => {
+  if (!Number.isInteger(tabIndex) || tabIndex < 0 || tabIndex >= tabs.length) {
+    return { success: false, reason: 'bad-index' };
+  }
   closeTab(tabIndex);
   return { success: true };
 });
 
 ipcMain.handle('switch-tab', (event, tabIndex) => {
+  if (!Number.isInteger(tabIndex) || tabIndex < 0 || tabIndex >= tabs.length) {
+    return { success: false, reason: 'bad-index' };
+  }
   switchToTab(tabIndex);
   return { success: true };
 });
@@ -1479,13 +1665,52 @@ async function ensureDirectories() {
   }
 }
 
+const EXTENSION_ID_PATTERN = /^[A-Za-z0-9_]{1,64}_[0-9A-Za-z._-]{1,32}$/;
+const EXTENSION_MAX_FILES = 4000;
+const EXTENSION_MAX_BYTES = 64 * 1024 * 1024;
+const EXTENSION_MAX_DEPTH = 8;
+
+function sanitizeExtensionIdPart(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/[^A-Za-z0-9._-]/g, '_')
+    .slice(0, 32);
+}
+
+function isValidExtensionId(id) {
+  return typeof id === 'string' && EXTENSION_ID_PATTERN.test(id) && !id.includes('..');
+}
+
+function resolveExtensionDir(id) {
+  if (!isValidExtensionId(id)) return null;
+  const target = path.join(extensionsPath, id);
+  const rel = path.relative(extensionsPath, target);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  if (rel.split(path.sep).includes('..')) return null;
+  return target;
+}
+
+function resolveExtensionChild(id, rel) {
+  if (typeof rel !== 'string' || !rel || path.isAbsolute(rel)) return null;
+  if (rel.includes(':') || rel.includes('\0')) return null;
+  const segs = rel.split(/[\\/]/);
+  if (segs.some(seg => seg === '' || seg === '.' || seg === '..')) return null;
+  const base = resolveExtensionDir(id);
+  if (!base) return null;
+  const target = path.join(base, ...segs);
+  const parentRel = path.relative(base, target);
+  if (!parentRel || parentRel.startsWith('..') || path.isAbsolute(parentRel)) return null;
+  return target;
+}
+
 // 读取插件配置
 async function readExtensionsConfig() {
   try {
     await ensureDirectories();
     if (fsSync.existsSync(configPath)) {
       const data = await fs.readFile(configPath, 'utf8');
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      const list = Array.isArray(parsed.extensions) ? parsed.extensions : [];
+      return { extensions: list.filter(ext => ext && isValidExtensionId(ext.id)) };
     }
   } catch (error) {
     console.error('读取插件配置失败:', error);
@@ -1508,6 +1733,16 @@ async function saveExtensionsConfig(config) {
 // 验证插件文件夹
 async function validateExtensionFolder(folderPath) {
   try {
+    if (typeof folderPath !== 'string' || !folderPath || !path.isAbsolute(folderPath)) {
+      return { valid: false, error: '插件目录路径非法' };
+    }
+    if (folderPath.includes('\0')) {
+      return { valid: false, error: '插件目录路径非法' };
+    }
+    const folderStat = await fs.lstat(folderPath);
+    if (folderStat.isSymbolicLink() || !folderStat.isDirectory()) {
+      return { valid: false, error: '插件目录必须是真实文件夹' };
+    }
     const manifestPath = path.join(folderPath, 'manifest.json');
     if (!fsSync.existsSync(manifestPath)) {
       return { valid: false, error: '文件夹中未找到manifest.json文件' };
@@ -1526,6 +1761,15 @@ async function validateExtensionFolder(folderPath) {
     if (!manifest.manifest_version) {
       return { valid: false, error: 'manifest.json中缺少manifest_version字段' };
     }
+    if (typeof manifest.name !== 'string' || manifest.name.length > 128) {
+      return { valid: false, error: 'manifest.json中的name字段非法' };
+    }
+    if (typeof manifest.version !== 'string' || !/^[0-9A-Za-z._-]{1,32}$/.test(manifest.version)) {
+      return { valid: false, error: 'manifest.json中的version字段非法' };
+    }
+    if (manifest.manifest_version !== 2 && manifest.manifest_version !== 3) {
+      return { valid: false, error: '仅支持manifest_version 2或3' };
+    }
     
     return { valid: true, manifest };
   } catch (error) {
@@ -1534,9 +1778,37 @@ async function validateExtensionFolder(folderPath) {
 }
 
 // 复制插件到扩展目录
+async function guardExtensionTree(sourcePath, budget, depth) {
+  if (depth > EXTENSION_MAX_DEPTH) return false;
+  try {
+    const entries = await fs.readdir(sourcePath, { withFileTypes: true });
+    for (const entry of entries) {
+      const child = path.join(sourcePath, entry.name);
+      if (entry.isSymbolicLink()) return false;
+      if (entry.isDirectory()) {
+        if (!await guardExtensionTree(child, budget, depth + 1)) return false;
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const info = await fs.lstat(child);
+      budget.files += 1;
+      budget.bytes += info.size;
+      if (budget.files > EXTENSION_MAX_FILES || budget.bytes > EXTENSION_MAX_BYTES) return false;
+    }
+    return true;
+  } catch (error) {
+    console.error('检查插件目录失败:', error);
+    return false;
+  }
+}
+
 async function copyExtensionToStorage(sourcePath, extensionId) {
   try {
     const targetPath = path.join(extensionsPath, extensionId);
+    const targetRel = path.relative(extensionsPath, targetPath);
+    if (!targetRel || targetRel.startsWith('..') || path.isAbsolute(targetRel)) return false;
+    if (targetRel.split(path.sep).includes('..')) return false;
+    if (!await guardExtensionTree(sourcePath, { files: 0, bytes: 0 }, 0)) return false;
     await fs.mkdir(targetPath, { recursive: true });
     
     // 简单的复制实现（实际应该递归复制所有文件）
@@ -1545,7 +1817,7 @@ async function copyExtensionToStorage(sourcePath, extensionId) {
       const sourceFile = path.join(sourcePath, file);
       const targetFile = path.join(targetPath, file);
       
-      const stat = await fs.stat(sourceFile);
+      const stat = await fs.lstat(sourceFile);
       if (stat.isDirectory()) {
         await copyExtensionToStorage(sourceFile, path.join(extensionId, file));
       } else {
@@ -1613,7 +1885,10 @@ ipcMain.handle('add-extension', async (event, folderPath) => {
     }
     
     const { manifest } = validation;
-    const extensionId = `${manifest.name.replace(/[^a-zA-Z0-9]/g, '_')}_${manifest.version}`;
+    const extensionId = `${sanitizeExtensionIdPart(manifest.name.replace(/[^a-zA-Z0-9]/g, '_'))}_${sanitizeExtensionIdPart(manifest.version)}`;
+    if (!isValidExtensionId(extensionId)) {
+      return { success: false, error: '插件标识非法' };
+    }
     
     // 读取现有配置
     const config = await readExtensionsConfig();
@@ -1632,10 +1907,13 @@ ipcMain.handle('add-extension', async (event, folderPath) => {
     
     // 获取图标路径
     let iconPath = '';
-    if (manifest.icons) {
-      const iconSizes = Object.keys(manifest.icons).sort((a, b) => parseInt(b) - parseInt(a));
+    if (manifest.icons && typeof manifest.icons === 'object') {
+      const iconSizes = Object.keys(manifest.icons)
+        .filter(size => /^[0-9]{1,4}$/.test(size))
+        .sort((a, b) => parseInt(b) - parseInt(a));
       if (iconSizes.length > 0) {
-        iconPath = path.join(extensionsPath, extensionId, manifest.icons[iconSizes[0]]);
+        const candidate = resolveExtensionChild(extensionId, manifest.icons[iconSizes[0]]);
+        if (candidate && fsSync.existsSync(candidate)) iconPath = candidate;
       }
     }
     
@@ -1646,7 +1924,7 @@ ipcMain.handle('add-extension', async (event, folderPath) => {
       version: manifest.version,
       description: manifest.description || '',
       icon: iconPath,
-      path: path.join(extensionsPath, extensionId),
+      path: resolveExtensionDir(extensionId) || '',
       enabled: true,
       addedDate: new Date().toISOString()
     };
@@ -1669,7 +1947,21 @@ ipcMain.handle('add-extension', async (event, folderPath) => {
 ipcMain.handle('get-extensions', async () => {
   try {
     const config = await readExtensionsConfig();
-    return { success: true, extensions: config.extensions };
+    const safe = config.extensions.map(ext => {
+      const dir = resolveExtensionDir(ext.id);
+      const iconIsChild = dir && typeof ext.icon === 'string' && resolveExtensionChild(ext.id, path.relative(dir, ext.icon)) === ext.icon;
+      return {
+        id: ext.id,
+        name: typeof ext.name === 'string' ? ext.name.slice(0, 128) : '',
+        version: typeof ext.version === 'string' ? ext.version.slice(0, 32) : '',
+        description: typeof ext.description === 'string' ? ext.description.slice(0, 1024) : '',
+        icon: iconIsChild ? ext.icon : '',
+        path: dir || '',
+        enabled: !!ext.enabled,
+        addedDate: typeof ext.addedDate === 'string' ? ext.addedDate : ''
+      };
+    });
+    return { success: true, extensions: safe };
   } catch (error) {
     return { success: false, error: error.message, extensions: [] };
   }
@@ -1678,6 +1970,9 @@ ipcMain.handle('get-extensions', async () => {
 // IPC处理：切换插件状态
 ipcMain.handle('toggle-extension', async (event, { id, enabled }) => {
   try {
+    if (!isValidExtensionId(id)) {
+      return { success: false, error: '插件标识非法' };
+    }
     const config = await readExtensionsConfig();
     const extension = config.extensions.find(ext => ext.id === id);
     
@@ -1701,6 +1996,9 @@ ipcMain.handle('toggle-extension', async (event, { id, enabled }) => {
 // IPC处理：移除插件
 ipcMain.handle('remove-extension', async (event, id) => {
   try {
+    if (!isValidExtensionId(id)) {
+      return { success: false, error: '插件标识非法' };
+    }
     const config = await readExtensionsConfig();
     const extensionIndex = config.extensions.findIndex(ext => ext.id === id);
     
@@ -1712,7 +2010,10 @@ ipcMain.handle('remove-extension', async (event, id) => {
     await unloadExtension(id);
     
     // 删除插件文件
-    const extensionPath = path.join(extensionsPath, id);
+    const extensionPath = resolveExtensionDir(id);
+    if (!extensionPath) {
+      return { success: false, error: '插件目录越界' };
+    }
     if (fsSync.existsSync(extensionPath)) {
       await fs.rm(extensionPath, { recursive: true, force: true });
     }
